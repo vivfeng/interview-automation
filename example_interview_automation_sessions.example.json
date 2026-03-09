@@ -1,0 +1,29 @@
+[
+  {
+    "date": "1/15/25",
+    "folder_name": "(1/15/25) Example Focus Group Session",
+    "topic": "Example Focus Group - Product Feedback",
+    "meeting_ids": ["xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"],
+    "granola_summary": "Brief AI-generated summary from Granola. Key themes, participant reactions, notable quotes.",
+    "granola_notes": "Raw meeting notes. Participant names, specific feedback, feature requests, bugs observed."
+  },
+  {
+    "date": "1/22/25",
+    "folder_name": "(1/22/25) Example 1:1 User Interview",
+    "topic": "1:1 User Interview - Onboarding Flow",
+    "meeting_ids": ["yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"],
+    "granola_summary": "Summary of a 1:1 interview. User struggled with onboarding step 3.",
+    "granola_notes": "Participant background. Task completion notes. Usability issues."
+  },
+  {
+    "date": "2/5/25",
+    "folder_name": "(2/5/25) Example Design Review",
+    "topic": "Design Review - Homepage Variants",
+    "meeting_ids": [
+      "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+      "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    ],
+    "granola_summary": "Design review session. Variant B preferred by 4/5 participants.",
+    "granola_notes": "Prototype ratings. UI feedback per participant. Action items."
+  }
+]
