@@ -208,119 +208,425 @@ def fetch_youtube_livestreams(api_key_or_cookies):
 
 
 def get_youtube_transcript(video_id):
-    """Try to get YouTube transcript via yt-dlp"""
+    """Legacy plain-text transcript (no timestamps). Kept for backward compat."""
+    segments = get_youtube_transcript_timestamped(video_id)
+    return " ".join(s["text"] for s in segments)
+
+
+def get_youtube_transcript_timestamped(video_id):
+    """Return YT auto-caption segments as [{'start': float_sec, 'text': str}, ...]
+
+    Preserving timestamps is what lets us correlate each line with a video frame
+    for speaker attribution.
+    """
     try:
         import subprocess
-        result = subprocess.run(
+        subprocess.run(
             ["yt-dlp", "--skip-download", "--write-auto-sub", "--sub-format", "json3",
              "--output", f"/tmp/yt_{video_id}", f"https://www.youtube.com/watch?v={video_id}"],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=120
         )
-        # Try to read the transcript file
         import glob
         files = glob.glob(f"/tmp/yt_{video_id}*.json3")
-        if files:
-            with open(files[0]) as f:
-                data = json.load(f)
-            events = data.get("events", [])
-            lines = []
-            for ev in events:
-                segs = ev.get("segs", [])
-                text = "".join(s.get("utf8", "") for s in segs).strip()
-                if text:
-                    lines.append(text)
-            return " ".join(lines)
+        if not files:
+            return []
+        with open(files[0]) as f:
+            data = json.load(f)
+        segments = []
+        for ev in data.get("events", []):
+            start_ms = ev.get("tStartMs")
+            if start_ms is None:
+                continue
+            text = "".join(s.get("utf8", "") for s in ev.get("segs", [])).strip()
+            if not text:
+                continue
+            segments.append({"start": start_ms / 1000.0, "text": text})
+        return segments
     except Exception as e:
         log(f"Transcript fetch failed for {video_id}: {e}", "warn")
-    return ""
+        return []
+
+
+def _format_timestamp(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+# ─── Video-assisted speaker diarization ─────────────────────────────────────
+def download_youtube_video(video_id, out_dir="/tmp"):
+    """Download a low-res MP4 for frame extraction. Returns the file path."""
+    import subprocess
+    out_template = os.path.join(out_dir, f"vid_{video_id}.%(ext)s")
+    # 360p or lower — we only need faces, not pixels.
+    subprocess.run(
+        ["yt-dlp", "-f", "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[height<=480]",
+         "--merge-output-format", "mp4", "-o", out_template,
+         f"https://www.youtube.com/watch?v={video_id}"],
+        capture_output=True, text=True, timeout=600, check=True,
+    )
+    import glob
+    matches = glob.glob(os.path.join(out_dir, f"vid_{video_id}.*"))
+    matches = [m for m in matches if not m.endswith(".part")]
+    if not matches:
+        raise RuntimeError("yt-dlp produced no video file")
+    return matches[0]
+
+
+def extract_video_frames(video_path, frame_interval_sec=60, out_dir=None):
+    """Extract 1 frame per `frame_interval_sec` using ffmpeg.
+
+    Returns a list of {"t": seconds_offset, "path": "/tmp/...jpg"}.
+    """
+    import subprocess
+    import glob as _glob
+
+    if out_dir is None:
+        out_dir = f"/tmp/frames_{os.path.basename(video_path)}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # fps = 1/interval → one frame every N seconds.
+    fps_filter = f"fps=1/{frame_interval_sec}"
+    out_pattern = os.path.join(out_dir, "f_%04d.jpg")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vf", fps_filter,
+         "-q:v", "5", out_pattern],
+        capture_output=True, text=True, timeout=600, check=True,
+    )
+    paths = sorted(_glob.glob(os.path.join(out_dir, "f_*.jpg")))
+    # Frame i (0-indexed) represents timestamp i * interval.
+    return [{"t": i * frame_interval_sec, "path": p} for i, p in enumerate(paths)]
+
+
+def diarize_transcript_with_video(video_id, segments, video_title, max_frames=60):
+    """Use Claude vision to produce a speaker-attributed transcript.
+
+    Strategy:
+      1. Download video (low-res) and extract up to `max_frames` still frames
+         spread evenly across the interview.
+      2. Send frames + the timestamped transcript to Claude with instructions
+         to assign each transcript segment to a speaker based on who is
+         visibly speaking (mouth movement, active speaker focus) at that time.
+
+    Returns a plain-text transcript string with speaker prefixes like:
+        [0:12] Alex: Can you walk me through ...
+        [0:35] Participant (guest): Well, usually I ...
+    Falls back to the raw transcript on any error.
+    """
+    if not segments:
+        return ""
+
+    # Enforce ENABLE_VIDEO_DIARIZATION env gate upstream; this function assumes
+    # caller decided to try.
+    api_key = _get_anthropic_key()
+    if not api_key:
+        log("  ⚠️ No Anthropic key; cannot run video diarization", "warn")
+        return "\n".join(f"[{_format_timestamp(s['start'])}] {s['text']}" for s in segments)
+
+    try:
+        log(f"  🎞️  Downloading video for diarization: {video_id}")
+        video_path = download_youtube_video(video_id)
+    except Exception as e:
+        log(f"  ⚠️ Video download failed, falling back to text-only: {e}", "warn")
+        return "\n".join(f"[{_format_timestamp(s['start'])}] {s['text']}" for s in segments)
+
+    # Pick a frame interval that keeps us under max_frames.
+    duration = segments[-1]["start"] if segments else 0
+    interval = max(30, int(duration // max_frames) + 1) if duration > 0 else 60
+
+    try:
+        log(f"  🖼️  Extracting 1 frame per {interval}s from {_format_timestamp(duration)} video...")
+        frames = extract_video_frames(video_path, frame_interval_sec=interval)
+    except Exception as e:
+        log(f"  ⚠️ Frame extraction failed, falling back to text-only: {e}", "warn")
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+        return "\n".join(f"[{_format_timestamp(s['start'])}] {s['text']}" for s in segments)
+
+    # Cap frames just in case.
+    frames = frames[:max_frames]
+    log(f"  🖼️  {len(frames)} frames extracted; sending to Claude for diarization")
+
+    # Build the timestamped transcript block.
+    transcript_lines = [f"[{_format_timestamp(s['start'])}] {s['text']}" for s in segments]
+    transcript_block = "\n".join(transcript_lines)
+    transcript_block = _clip(transcript_block, _TRANSCRIPT_CHAR_CAP)
+
+    prompt_text = f"""You are analyzing a user-research interview to assign speaker labels to each line of transcript.
+
+<video_title>{video_title}</video_title>
+
+## Arcade team (interviewers)
+The following people are Arcade team members and are interviewers: Alex, Vivian, Mariam, Savannah, Sarah. Anyone else is an interviewee / research participant.
+
+## Input 1: Video frames
+I am providing {len(frames)} still frames sampled one every {interval} seconds. Frame N corresponds to timestamp {interval * 0}s + N × {interval}s (i.e. frame 1 = 0:00, frame 2 = {_format_timestamp(interval)}, etc.). In each frame, identify which tile / person appears to be actively speaking (look for mouth movement, active-speaker highlight, or obvious focus). Track individuals consistently — a person in tile position X at 2:00 is likely the same person at 2:30.
+
+## Input 2: Timestamped transcript
+Each line is prefixed with its start time.
+```
+{transcript_block}
+```
+
+## Your task
+Produce a speaker-attributed transcript. Rules:
+1. For each transcript line, determine which speaker said it by looking at the nearest frame(s) in time and seeing who was speaking.
+2. Use the Arcade team member's first name when you can identify them. Use "Participant" (or "Participant 2", "Participant 3" if there are multiple) for interviewees.
+3. If you genuinely cannot tell who is speaking for a line, use "Unknown". Do NOT guess.
+4. Merge consecutive lines from the same speaker into one paragraph, keeping the earliest timestamp.
+5. Output format (plain text, no markdown, no preamble):
+
+[mm:ss] SpeakerName: the spoken text
+[mm:ss] SpeakerName: the next spoken text
+
+Begin the output immediately with the first speaker line. Do not include any explanation before or after."""
+
+    # Build Anthropic multimodal message.
+    try:
+        from anthropic import Anthropic
+        import base64
+        client = Anthropic(api_key=api_key)
+
+        content = []
+        for f in frames:
+            try:
+                with open(f["path"], "rb") as fh:
+                    b64 = base64.standard_b64encode(fh.read()).decode("ascii")
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+                })
+            except Exception as e:
+                log(f"  ⚠️ Could not read frame {f['path']}: {e}", "warn")
+        content.append({"type": "text", "text": prompt_text})
+
+        msg = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=16000,
+            messages=[{"role": "user", "content": content}],
+        )
+        diarized = msg.content[0].text.strip()
+        log(f"  ✅ Diarization produced {len(diarized)} chars")
+        return diarized
+    except Exception as e:
+        log(f"  ⚠️ Video diarization call failed: {e}", "warn")
+        return "\n".join(transcript_lines)
+    finally:
+        # Best-effort cleanup of temp files
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
 
 
 # ─── AI Synthesis ─────────────────────────────────────────────────────────────
-def llm_synthesize(prompt, api_key):
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+
+def llm_synthesize(prompt, api_key, max_tokens=4000):
     """Call Claude API for synthesis tasks"""
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
+        model=CLAUDE_MODEL,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}]
     )
     return msg.content[0].text
 
 
+def _get_anthropic_key():
+    try:
+        return (
+            session.get("anthropic_api_key", "")
+            or _g_anthropic_key.get("key", "")
+            or os.environ.get("ANTHROPIC_API_KEY", "")
+        )
+    except RuntimeError:
+        return _g_anthropic_key.get("key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+# Send the full transcript. Claude's context window is large enough to hold
+# a multi-hour interview — truncation was the single biggest reason details
+# and Q&A alignment were being dropped.
+_TRANSCRIPT_CHAR_CAP = 400_000  # safety rail, not a quality knob
+_SUMMARY_CHAR_CAP = 50_000
+
+
+def _clip(text, cap):
+    if not text:
+        return ""
+    if len(text) <= cap:
+        return text
+    return text[:cap] + "\n\n[... truncated at safety cap ...]"
+
+
 def extract_interview_data(transcript, granola_summary, video_title):
-    """Use AI to parse transcript into structured Q&A per person"""
-    prompt = f"""You are analyzing a user research interview transcript. Extract the structured interview data.
+    """Parse a user research interview into strictly-aligned Q&A per participant.
 
-Video Title: {video_title}
-Granola Summary: {granola_summary[:2000] if granola_summary else 'Not available'}
-Transcript: {transcript[:6000] if transcript else 'Not available'}
+    Key correctness rules (to fix the debrief-sheet misalignment):
+      - Every response must be a VERBATIM or near-verbatim quote from the transcript.
+      - A response is only attributed to a named person if the transcript/summary
+        makes that attribution unambiguous. Otherwise use "Unattributed".
+      - Questions are returned in the order they were actually asked in the session.
+      - Do not invent questions that weren't asked. Do not merge distinct questions.
+    """
+    transcript_clean = _clip(transcript, _TRANSCRIPT_CHAR_CAP)
+    summary_clean = _clip(granola_summary, _SUMMARY_CHAR_CAP)
 
-Return a JSON object with this exact structure:
+    prompt = f"""You are analyzing a user research interview transcript. Your job is to produce a faithful, strictly-aligned Q&A structure so it can be dropped into a debrief spreadsheet. Accuracy of attribution matters MORE than coverage.
+
+<video_title>{video_title}</video_title>
+
+<granola_summary>
+{summary_clean if summary_clean else "(not available)"}
+</granola_summary>
+
+<transcript>
+{transcript_clean if transcript_clean else "(not available)"}
+</transcript>
+
+## Team context
+Arcade team members who may be interviewers: Alex, Vivian, Mariam, Savannah, Sarah.
+Any other speaker is an interviewee (user research participant).
+
+## Hard rules — READ CAREFULLY
+1. **Preserve question order.** Return questions in the order they were actually asked in the session. Do NOT reorder, merge, or paraphrase into higher-level themes.
+2. **Only include questions that were actually asked aloud** by someone in the session. Do not include questions from the interview guide that were skipped.
+3. **Attribution must be unambiguous.** Only attribute a response to a specific named person if the transcript or summary clearly indicates who said it (e.g. speaker label, "Sarah said...", explicit context). If you cannot tell who said a response, use the key `"Unattributed"` — do NOT guess.
+4. **Responses must be quote-grounded.** Each response value should be a direct quote or a very close paraphrase. If you need to shorten, wrap the quoted part in quotation marks and add ellipses. Never fabricate specifics.
+5. **One row = one question.** If the same question was re-asked, merge into one row and combine responses per person.
+6. **Don't over-cluster.** If an interviewer asked 12 distinct questions, return 12 rows. Don't collapse to 5.
+7. **If a participant didn't answer a question, leave their cell out of `responses`.** Do not emit empty strings.
+8. **If you cannot extract reliable Q&A at all** (e.g. transcript too noisy, no speaker labels, summary lacks detail), return an empty `questions` array and set `extraction_confidence` to `"low"` with a brief `extraction_notes` explanation. This is BETTER than making things up.
+
+## Output format — return ONLY this JSON, no prose, no code fences
 {{
-  "participants": ["Name1", "Name2", ...],  // list of all people including interviewees and Arcade team members (Alex, Vivian, Mariam, Savannah, Sarah)
-  "arcade_members": ["Name1"],  // only Arcade team members present
-  "interviewees": ["Name1"],    // only interviewees (non-Arcade)
+  "participants": ["Name1", "Name2", "..."],
+  "arcade_members": ["Name1"],
+  "interviewees": ["Name1"],
+  "extraction_confidence": "high" | "medium" | "low",
+  "extraction_notes": "One sentence explaining confidence (e.g., 'Transcript had clear speaker labels' or 'No speaker labels in YT transcript; most responses unattributed').",
   "questions": [
     {{
-      "question": "The question asked",
+      "question": "The verbatim (or near-verbatim) question asked.",
+      "asked_by": "Name of the interviewer who asked it, or 'Unknown'",
       "responses": {{
-        "Name1": "Their response",
-        "Name2": "Their response"
+        "InterviewName": "Direct quote or tight paraphrase of their response.",
+        "Unattributed": "A response that was given but cannot be attributed to a specific person."
       }}
     }}
   ],
-  "interview_guide_questions": ["Q1", "Q2", ...]  // questions Arcade planned to ask
+  "interview_guide_questions": ["Q1", "Q2", "..."]
 }}
-
-Return ONLY valid JSON, no other text."""
+"""
 
     try:
         from anthropic import Anthropic
-        # Use the API key from session if available
-        try:
-            api_key = session.get("anthropic_api_key", "") or _g_anthropic_key.get("key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
-        except RuntimeError:
-            api_key = _g_anthropic_key.get("key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = _get_anthropic_key()
         if not api_key:
             return None
         client = Anthropic(api_key=api_key)
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=3000,
+            model=CLAUDE_MODEL,
+            max_tokens=8000,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = msg.content[0].text.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
+        data = json.loads(raw)
+        confidence = data.get("extraction_confidence", "unknown")
+        notes = data.get("extraction_notes", "")
+        log(f"  🧠 Extraction confidence: {confidence}. {notes}")
+        return data
     except Exception as e:
         log(f"AI synthesis error: {e}", "warn")
         return None
 
 
 def synthesize_high_level_summary(granola_summary, transcript, interview_data, video_title):
-    """Generate high-level product strategy summary"""
-    prompt = f"""You are a senior product strategist. Based on this user interview, write a concise 1-paragraph high-level product and design takeaway summary. Focus on actionable product strategy insights.
+    """Generate a rich, structured product takeaways document.
 
-Interview: {video_title}
-Granola AI Summary: {granola_summary[:2000] if granola_summary else 'N/A'}
-Key Q&A: {json.dumps(interview_data.get('questions', [])[:5], indent=2) if interview_data else 'N/A'}
-Transcript excerpt: {transcript[:3000] if transcript else 'N/A'}
+    Returns a single plain-text string with section headings, ready to drop into
+    a Google Doc. Designed to replace both the old verbatim Granola dump and the
+    old 1-paragraph strategist blurb — hence it intentionally includes the
+    Granola summary near the top.
+    """
+    transcript_clean = _clip(transcript, _TRANSCRIPT_CHAR_CAP)
+    summary_clean = _clip(granola_summary, _SUMMARY_CHAR_CAP)
+    questions_json = json.dumps(interview_data.get("questions", []), indent=2) if interview_data else "N/A"
 
-Write 1 focused paragraph (4-6 sentences) highlighting the most important product strategy insights. Be specific, not generic."""
+    prompt = f"""You are a senior product strategist and user researcher working with the Arcade team. You have just watched a user interview and need to produce a single takeaways document that a PM, designer, or eng lead can read in 3 minutes and walk away with clear, evidence-backed product direction.
+
+<interview_title>{video_title}</interview_title>
+
+<granola_summary>
+{summary_clean if summary_clean else "(not available)"}
+</granola_summary>
+
+<full_transcript>
+{transcript_clean if transcript_clean else "(not available)"}
+</full_transcript>
+
+<structured_qa>
+{questions_json}
+</structured_qa>
+
+## Output requirements
+Produce a plain-text document using the EXACT section headings and order below. Use short paragraphs and bullet lists (start bullets with "• "). No markdown bold or italics — this will be rendered in a Google Doc as plain text.
+
+Rules:
+- **Ground every claim in evidence.** When possible, include a direct quote in quotation marks, attributed to a participant (e.g., "I just gave up at that point" — Participant).
+- **Be specific.** Name the feature, the flow, the word the user used. Avoid vague language like "users struggled with onboarding" — instead say what specifically broke.
+- **Distinguish signal from noise.** If only one participant said something, label it "(single data point)". If multiple said the same thing, say so.
+- **No invented detail.** If the transcript doesn't say it, don't claim it. If you're uncertain, say "Unclear from the transcript".
+- **Write for decision-makers.** The goal is: a reader should finish this doc knowing what to change in the product.
+
+=== SECTIONS ===
+
+TL;DR
+One tight paragraph (3-4 sentences) naming the single most important thing the team should take from this session. This is the only section that should read as pure prose.
+
+Key Insights
+5-8 bullets. Each bullet should be a concrete insight (not a restatement of a question), followed by a supporting quote or observation. Format: "• Insight statement. Evidence: quote or paraphrase."
+
+Pain Points & Friction
+What specifically frustrated users, where in the product, and why. 3-6 bullets. Include the step or feature name and the specific failure mode.
+
+What's Working
+Things users liked or praised. Be honest — if there were none, say so. 2-5 bullets with evidence.
+
+Feature Requests & Desires
+What users explicitly asked for OR strongly implied they wanted. 2-5 bullets. Label each as (explicit ask) or (implied). Include a quote when available.
+
+Surprising or Contrarian Moments
+Anything that contradicted the team's assumptions, was counterintuitive, or would change a PM's roadmap. 1-4 bullets. If nothing qualifies, write "(nothing notable)".
+
+Direct Quotes Worth Keeping
+5-10 verbatim quotes that capture the user's actual voice. Format: "Quote text" — Participant name (or Participant if unattributed). Pick quotes a designer or marketer would actually use in a readout.
+
+Recommended Next Steps
+3-6 concrete, actionable next steps for the product/design/eng team. Each should be something a PM could turn into a ticket tomorrow. Format: "• [Team] Action — rationale."
+
+Open Questions for Follow-up Research
+2-5 questions that came out of this session but weren't answered. These feed the next round of research.
+
+Begin the document now, starting with the line "TL;DR" (no preamble, no title)."""
 
     try:
         from anthropic import Anthropic
-        try:
-            api_key = session.get("anthropic_api_key", "") or _g_anthropic_key.get("key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
-        except RuntimeError:
-            api_key = _g_anthropic_key.get("key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = _get_anthropic_key()
         if not api_key:
             return "High-level summary could not be generated (no Anthropic API key)."
         client = Anthropic(api_key=api_key)
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
+            model=CLAUDE_MODEL,
+            max_tokens=6000,
             messages=[{"role": "user", "content": prompt}]
         )
         return msg.content[0].text.strip()
@@ -424,6 +730,84 @@ def doc_text_requests(text):
     return [{"insertText": {"location": {"index": 1}, "text": text}}]
 
 
+def build_debrief_sheet(interview_data):
+    """Turn extracted interview_data into (headers, rows) for the debrief sheet.
+
+    Always puts Arcade interviewers last (after interviewees). Includes an
+    "Unattributed" column if the extractor flagged unknown-speaker responses,
+    so the team knows that signal exists without attributing to the wrong name.
+    """
+    if not interview_data or not interview_data.get("questions"):
+        return (
+            ["Question", "Asked By", "(Response)", "Extraction notes"],
+            [[
+                "(Transcript not available or extraction confidence too low — add manually)",
+                "",
+                "",
+                (interview_data or {}).get("extraction_notes", ""),
+            ]],
+        )
+
+    questions_data = interview_data.get("questions", [])
+    arcade_members = interview_data.get("arcade_members", []) or []
+    interviewees = interview_data.get("interviewees", []) or []
+    declared_participants = interview_data.get("participants", []) or []
+
+    # Discover any speaker names that actually appear in responses so nothing
+    # gets silently dropped — this is the core fix for misalignment.
+    seen_speakers = set()
+    for q in questions_data:
+        for name in (q.get("responses") or {}).keys():
+            seen_speakers.add(name)
+
+    ordered_speakers = []
+    # Interviewees first (most important column for a debrief).
+    for name in interviewees:
+        if name in seen_speakers and name not in ordered_speakers:
+            ordered_speakers.append(name)
+    # Then arcade interviewers who actually spoke.
+    for name in arcade_members:
+        if name in seen_speakers and name not in ordered_speakers:
+            ordered_speakers.append(name)
+    # Anyone from the declared participant list we haven't placed yet.
+    for name in declared_participants:
+        if name in seen_speakers and name not in ordered_speakers:
+            ordered_speakers.append(name)
+    # Anything else observed in responses (e.g., Participant 2, Unattributed).
+    for name in sorted(seen_speakers):
+        if name not in ordered_speakers:
+            ordered_speakers.append(name)
+
+    headers = ["#", "Question", "Asked By"] + ordered_speakers
+    rows = []
+    for i, q in enumerate(questions_data, 1):
+        responses = q.get("responses") or {}
+        row = [str(i), q.get("question", ""), q.get("asked_by", "")]
+        for name in ordered_speakers:
+            row.append(responses.get(name, ""))
+        rows.append(row)
+    return headers, rows
+
+
+def build_combined_takeaways_text(date_str, granola_summary, hl_summary):
+    """Build the text body for the merged Interview Summary & Takeaways doc.
+
+    Starts with a short title line, then the Granola AI summary (raw, as the
+    team trusts this), then the structured synthesized takeaways.
+    """
+    parts = [f"({date_str}) Interview Summary & Takeaways", ""]
+    if granola_summary:
+        parts.append("── Granola AI Summary ──")
+        parts.append("")
+        parts.append(granola_summary.strip())
+        parts.append("")
+    parts.append("── Product Takeaways ──")
+    parts.append("")
+    parts.append((hl_summary or "(takeaways not generated)").strip())
+    parts.append("")
+    return "\n".join(parts)
+
+
 # ─── Main Workflow ────────────────────────────────────────────────────────────
 def run_workflow(config):
     """Main workflow: match YT streams to Granola notes, create folders + docs"""
@@ -485,8 +869,9 @@ def run_workflow(config):
 
             log(f"\n📹 Processing: {stream_title} ({date_str})")
 
-            # Check for content (skip empty streams)
-            transcript = get_youtube_transcript(video_id) if video_id else ""
+            # Fetch timestamped transcript so we can run video-assisted diarization.
+            yt_segments = get_youtube_transcript_timestamped(video_id) if video_id else []
+            transcript = " ".join(s["text"] for s in yt_segments) if yt_segments else ""
             stream_description = stream.get("description", "")
 
             if not transcript and not stream_description and not stream_title:
@@ -546,8 +931,19 @@ def run_workflow(config):
                     "warning": f"No Granola note found for {stream_title} ({date_str})"
                 })
 
-            # Use transcript: prefer Granola transcript, fallback to YT
-            best_transcript = granola_transcript or transcript or ""
+            # Build the best-available transcript.
+            # Priority:
+            #   1. Granola transcript if available (often already has speaker labels).
+            #   2. Video-assisted diarized YT transcript (if ENABLE_VIDEO_DIARIZATION).
+            #   3. Plain YT transcript.
+            best_transcript = granola_transcript or ""
+
+            video_diarization_enabled = os.environ.get("ENABLE_VIDEO_DIARIZATION", "").lower() in ("1", "true", "yes")
+            if not best_transcript and yt_segments and video_id and video_diarization_enabled:
+                log("🎥 Running video-assisted speaker diarization (ENABLE_VIDEO_DIARIZATION=1)...")
+                best_transcript = diarize_transcript_with_video(video_id, yt_segments, stream_title)
+            elif not best_transcript:
+                best_transcript = transcript
 
             # AI extraction
             log("🤖 Running AI analysis...")
@@ -567,21 +963,7 @@ def run_workflow(config):
 
             # ── Doc 1: Interview Debrief (Google Sheet) ──────────────────────
             log("📊 Creating Interview Debrief sheet...")
-            if interview_data and interview_data.get("questions"):
-                participants = interview_data.get("participants", [])
-                questions_data = interview_data.get("questions", [])
-                headers = ["Question"] + participants
-                rows = []
-                for q in questions_data:
-                    row = [q.get("question", "")]
-                    for p in participants:
-                        row.append(q.get("responses", {}).get(p, ""))
-                    rows.append(row)
-            else:
-                participants = ["Participant 1"] + [m for m in ARCADE_TEAM if m.lower() in stream_title.lower() or True][:1]
-                headers = ["Question"] + participants[:2]
-                rows = [["(Transcript not available — add manually)", "", ""]]
-
+            headers, rows = build_debrief_sheet(interview_data)
             sheet_id, sheet_url = create_google_sheet(
                 f"Process: Interview Debrief ({date_str})",
                 headers, rows, folder_id
@@ -614,55 +996,45 @@ def run_workflow(config):
             doc_links["guide"] = guide_url
             log(f"  ✅ Interview Guide created")
 
-            # ── Doc 3: Granola Summary (Google Doc) ──────────────────────────
-            if granola_summary:
-                log("📝 Creating Granola Summary doc...")
-                summary_text = f"Summary ({date_str}) Takeaways\n\n"
-                summary_text += granola_summary
-                _, summary_url = create_google_doc(
-                    f"Summary ({date_str}) Takeaways",
-                    doc_text_requests(summary_text),
+            # ── Doc 3: Recording Link (Google Doc) — ONLY if a video matched ─
+            if video_id and video_url:
+                log("🎥 Creating Recording doc...")
+                recording_text = (
+                    f"({date_str}) Recording\n\n"
+                    f"Go to this Link: {video_url}\n\n"
+                    f"Focus Group ({date_str})\n\n"
+                    f"Ensure you're logged in to Youtube with a heretic.fund account"
+                )
+                recording_doc_id, recording_url = create_google_doc(
+                    f"({date_str}) Recording",
+                    doc_text_requests(recording_text),
                     folder_id
                 )
-                doc_links["granola_summary"] = summary_url
-                log(f"  ✅ Granola Summary created")
+                doc_links["recording"] = recording_url
+                log(f"  ✅ Recording doc created")
+
+                # Copy recording doc to second folder
+                log("📋 Copying Recording doc to recordings folder...")
+                copy_file_to_folder(recording_doc_id, f"({date_str}) Recording", RECORDINGS_FOLDER_ID)
+                log(f"  ✅ Recording copy added to recordings folder")
             else:
-                log(f"  ⚠️ Skipping Granola Summary — no Granola note matched", "warn")
+                log("  ⏭️ Skipping Recording doc — no YouTube video matched")
 
-            # ── Doc 4: Recording Link (Google Doc) ───────────────────────────
-            log("🎥 Creating Recording doc...")
-            recording_text = (
-                f"({date_str}) Recording\n\n"
-                f"Go to this Link: {video_url}\n\n"
-                f"Focus Group ({date_str})\n\n"
-                f"Ensure you're logged in to Youtube with a heretic.fund account"
-            )
-            recording_doc_id, recording_url = create_google_doc(
-                f"({date_str}) Recording",
-                doc_text_requests(recording_text),
-                folder_id
-            )
-            doc_links["recording"] = recording_url
-            log(f"  ✅ Recording doc created")
-
-            # Copy recording doc to second folder
-            log("📋 Copying Recording doc to recordings folder...")
-            copy_file_to_folder(recording_doc_id, f"({date_str}) Recording", RECORDINGS_FOLDER_ID)
-            log(f"  ✅ Recording copy added to recordings folder")
-
-            # ── Doc 5: High-Level Product Takeaways (Google Doc) ─────────────
-            log("💡 Generating High-Level Product Takeaways...")
+            # ── Doc 4: Interview Summary & Takeaways (single merged doc) ─────
+            # This replaces the old "Granola Summary" + "High-Level Product
+            # Takeaways" duplicate pair. One doc, richer content.
+            log("💡 Generating Interview Summary & Takeaways...")
             hl_summary = synthesize_high_level_summary(
                 granola_summary, best_transcript, interview_data, stream_title
             )
-            hl_text = f"({date_str}) High-level Product Takeaways\n\n{hl_summary}"
-            _, hl_url = create_google_doc(
-                f"({date_str}) High-level Product Takeaways",
-                doc_text_requests(hl_text),
+            combined_text = build_combined_takeaways_text(date_str, granola_summary, hl_summary)
+            _, combined_url = create_google_doc(
+                f"({date_str}) Interview Summary & Takeaways",
+                doc_text_requests(combined_text),
                 folder_id
             )
-            doc_links["high_level"] = hl_url
-            log(f"  ✅ High-Level Takeaways created")
+            doc_links["takeaways"] = combined_url
+            log(f"  ✅ Combined Takeaways doc created")
 
             folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
             log(f"✅ Folder complete: {folder_name} → {folder_url}")
@@ -761,14 +1133,16 @@ def run_granola_direct_workflow(sessions):
 
             # ── Match YouTube video by date ───────────────────────────────────
             matched_video = find_youtube_video_for_date(all_videos, date_str)
+            yt_segments = []
             if matched_video:
                 video_url = matched_video["url"]
                 video_id = matched_video["id"]
                 log(f"  🎬 Matched YouTube video: {matched_video['title']} ({matched_video['published_at'][:10]})")
-                log(f"  ⬇️ Fetching YouTube transcript...")
-                yt_transcript = get_youtube_transcript(video_id)
+                log(f"  ⬇️ Fetching YouTube transcript (timestamped)...")
+                yt_segments = get_youtube_transcript_timestamped(video_id)
+                yt_transcript = " ".join(s["text"] for s in yt_segments)
                 if yt_transcript:
-                    log(f"  ✅ Got YouTube transcript ({len(yt_transcript)} chars)")
+                    log(f"  ✅ Got YouTube transcript ({len(yt_transcript)} chars, {len(yt_segments)} segments)")
                 else:
                     log(f"  ⚠️ No transcript available for this video", "warn")
             else:
@@ -777,9 +1151,15 @@ def run_granola_direct_workflow(sessions):
                 yt_transcript = ""
                 log(f"  ⚠️ No YouTube video found within 1 day of {date_str}", "warn")
 
-            # ── AI extraction using BOTH Granola notes AND YouTube transcript ─
+            # Video-assisted diarization to recover speaker attribution.
+            video_diarization_enabled = os.environ.get("ENABLE_VIDEO_DIARIZATION", "").lower() in ("1", "true", "yes")
+            combined_transcript = yt_transcript
+            if yt_segments and video_id and video_diarization_enabled:
+                log("🎥 Running video-assisted speaker diarization (ENABLE_VIDEO_DIARIZATION=1)...")
+                combined_transcript = diarize_transcript_with_video(video_id, yt_segments, topic) or yt_transcript
+
+            # ── AI extraction using BOTH Granola notes AND (diarized) YT transcript ─
             log("🤖 Running AI analysis (Granola + YouTube)...")
-            combined_transcript = yt_transcript  # YouTube is the full voice record
             interview_data = None
             if combined_transcript or granola_summary or granola_notes:
                 interview_data = extract_interview_data(
@@ -795,20 +1175,7 @@ def run_granola_direct_workflow(sessions):
 
             # ── Doc 1: Interview Debrief (Google Sheet) ───────────────────────
             log("📊 Creating Interview Debrief sheet...")
-            if interview_data and interview_data.get("questions"):
-                participants = interview_data.get("participants", [])
-                questions_data = interview_data.get("questions", [])
-                headers = ["Question"] + participants
-                rows = []
-                for q in questions_data:
-                    row = [q.get("question", "")]
-                    for p in participants:
-                        row.append(q.get("responses", {}).get(p, ""))
-                    rows.append(row)
-            else:
-                headers = ["Question", "Response"]
-                rows = [["(Add manually — transcript/notes not parsed)", ""]]
-
+            headers, rows = build_debrief_sheet(interview_data)
             sheet_id, sheet_url = create_google_sheet(
                 f"Process: Interview Debrief ({date_str})",
                 headers, rows, folder_id
@@ -841,67 +1208,48 @@ def run_granola_direct_workflow(sessions):
             doc_links["guide"] = guide_url
             log("  ✅ Interview Guide created")
 
-            # ── Doc 3: Summary Takeaways (verbatim Granola AI summary) ────────
-            log("📝 Creating Summary Takeaways doc...")
-            summary_text = f"Summary ({date_str}) Takeaways\n\n"
-            if granola_summary:
-                summary_text += granola_summary
-            elif granola_notes:
-                summary_text += granola_notes
-            else:
-                summary_text += "(No Granola notes available for this session)"
-            _, summary_url = create_google_doc(
-                f"Summary ({date_str}) Takeaways",
-                doc_text_requests(summary_text),
-                folder_id
-            )
-            doc_links["granola_summary"] = summary_url
-            log("  ✅ Summary Takeaways created")
-
-            # ── Doc 4: Recording Link (Google Doc) ────────────────────────────
-            log("🎥 Creating Recording doc...")
-            if video_url:
+            # ── Doc 3: Recording Link (Google Doc) — ONLY if a video matched ─
+            if video_id and video_url:
+                log("🎥 Creating Recording doc...")
                 recording_text = (
                     f"({date_str}) Recording\n\n"
                     f"Go to this Link: {video_url}\n\n"
                     f"Focus Group ({date_str})\n\n"
                     f"Ensure you're logged in to Youtube with a heretic.fund account"
                 )
-            else:
-                recording_text = (
-                    f"({date_str}) Recording\n\n"
-                    f"[No YouTube recording found for this session — add link manually]\n\n"
-                    f"Ensure you're logged in to Youtube with a heretic.fund account"
+                recording_doc_id, recording_url = create_google_doc(
+                    f"({date_str}) Recording",
+                    doc_text_requests(recording_text),
+                    folder_id
                 )
-            recording_doc_id, recording_url = create_google_doc(
-                f"({date_str}) Recording",
-                doc_text_requests(recording_text),
-                folder_id
-            )
-            doc_links["recording"] = recording_url
-            log("  ✅ Recording doc created")
+                doc_links["recording"] = recording_url
+                log("  ✅ Recording doc created")
 
-            # Copy recording doc to recordings folder
-            log("📋 Copying Recording doc to recordings folder...")
-            copy_file_to_folder(recording_doc_id, f"({date_str}) Recording", RECORDINGS_FOLDER_ID)
-            log("  ✅ Recording copy added to recordings folder")
+                # Copy recording doc to recordings folder
+                log("📋 Copying Recording doc to recordings folder...")
+                copy_file_to_folder(recording_doc_id, f"({date_str}) Recording", RECORDINGS_FOLDER_ID)
+                log("  ✅ Recording copy added to recordings folder")
+            else:
+                log("  ⏭️ Skipping Recording doc — no YouTube video matched")
 
-            # ── Doc 5: High-Level Product Takeaways (AI synthesized) ──────────
-            log("💡 Generating High-Level Product Takeaways...")
+            # ── Doc 4: Interview Summary & Takeaways (single merged doc) ──────
+            log("💡 Generating Interview Summary & Takeaways...")
             hl_summary = synthesize_high_level_summary(
-                granola_summary,
-                yt_transcript or granola_notes,  # prefer YT transcript for richer context
+                granola_summary or granola_notes,
+                combined_transcript or granola_notes,
                 interview_data,
                 topic
             )
-            hl_text = f"({date_str}) High-level Product Takeaways\n\n{hl_summary}"
-            _, hl_url = create_google_doc(
-                f"({date_str}) High-level Product Takeaways",
-                doc_text_requests(hl_text),
+            combined_text = build_combined_takeaways_text(
+                date_str, granola_summary or granola_notes, hl_summary
+            )
+            _, combined_url = create_google_doc(
+                f"({date_str}) Interview Summary & Takeaways",
+                doc_text_requests(combined_text),
                 folder_id
             )
-            doc_links["high_level"] = hl_url
-            log("  ✅ High-Level Takeaways created")
+            doc_links["takeaways"] = combined_url
+            log("  ✅ Combined Takeaways doc created")
 
             folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
             log(f"✅ Folder complete: {folder_name} → {folder_url}")
