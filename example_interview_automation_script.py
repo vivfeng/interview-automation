@@ -725,6 +725,110 @@ def copy_file_to_folder(file_id, new_name, dest_folder_id):
     return copied["id"]
 
 
+# ─── In-place update helpers (for regenerating existing folders) ────────────
+def list_folder_contents(folder_id):
+    """Return direct children of a Drive folder: [{id, name, mimeType}, ...]."""
+    drive = get_drive_service()
+    files = []
+    page_token = None
+    while True:
+        resp = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=100,
+            pageToken=page_token,
+        ).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def get_folder_name(folder_id):
+    drive = get_drive_service()
+    meta = drive.files().get(fileId=folder_id, fields="id, name, parents").execute()
+    return meta.get("name", "")
+
+
+def rename_drive_file(file_id, new_name):
+    drive = get_drive_service()
+    drive.files().update(fileId=file_id, body={"name": new_name}).execute()
+
+
+def replace_google_doc_content(doc_id, new_text):
+    """Clear a Google Doc's body and replace it with plain text.
+
+    The Docs API requires us to delete an existing range and then insert.
+    We use endIndex-1 because the trailing newline of the body is protected.
+    """
+    docs = get_docs_service()
+    doc = docs.documents().get(documentId=doc_id).execute()
+    end_index = doc.get("body", {}).get("content", [{}])[-1].get("endIndex", 1)
+    requests_batch = []
+    if end_index > 2:
+        requests_batch.append({
+            "deleteContentRange": {
+                "range": {"startIndex": 1, "endIndex": end_index - 1}
+            }
+        })
+    if new_text:
+        requests_batch.append({
+            "insertText": {"location": {"index": 1}, "text": new_text}
+        })
+    if requests_batch:
+        docs.documents().batchUpdate(
+            documentId=doc_id,
+            body={"requests": requests_batch},
+        ).execute()
+
+
+def replace_google_sheet_content(sheet_id, headers, rows):
+    """Clear the first sheet and write (headers + rows) starting at A1."""
+    sheets = get_sheets_service()
+    # 1. Clear everything on Sheet1
+    sheets.spreadsheets().values().clear(
+        spreadsheetId=sheet_id,
+        range="Sheet1",
+        body={},
+    ).execute()
+    # 2. Write headers + rows
+    all_rows = [headers] + rows
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range="Sheet1!A1",
+        valueInputOption="RAW",
+        body={"values": all_rows},
+    ).execute()
+    # 3. Bold header row
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{
+            "repeatCell": {
+                "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1},
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}}},
+                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+            }
+        }]}
+    ).execute()
+
+
+def _parse_date_from_folder_name(name):
+    """Extract an M/D/YY or M/D/YYYY date from a folder name like '(5/16/25) ...'.
+
+    Returns the date string as-is (preserving M/D/YY or M/D formatting) or ''.
+    """
+    import re
+    m = re.match(r"\s*\(([^)]+)\)", name)
+    if not m:
+        return ""
+    inner = m.group(1).strip()
+    # Accept common date shapes
+    if re.match(r"^\d{1,2}/\d{1,2}(/\d{2,4})?$", inner):
+        return inner
+    return ""
+
+
 def doc_text_requests(text):
     """Simple helper to insert plain text into a doc"""
     return [{"insertText": {"location": {"index": 1}, "text": text}}]
@@ -1277,6 +1381,305 @@ def run_granola_direct_workflow(sessions):
         current_job["running"] = False
 
 
+# ─── Regenerate existing folders in place ──────────────────────────────────
+# Name patterns used to locate the docs we created previously. These are
+# substring matches and deliberately loose so they work on both the old naming
+# ("Summary (...) Takeaways", "High-level Product Takeaways") and the new
+# merged naming ("Interview Summary & Takeaways").
+_DEBRIEF_SHEET_PATTERNS = ["interview debrief", "debrief"]
+_TAKEAWAYS_PATTERNS = [
+    "interview summary & takeaways",
+    "high-level product takeaways",
+    "high level product takeaways",
+]
+_ARCHIVE_SUMMARY_PATTERNS = [
+    "summary",  # matches "Summary (DATE) Takeaways"
+]
+
+
+def _find_file(files, patterns, mime_type=None, exclude_patterns=None):
+    """Find the first file whose name contains one of `patterns` (case-insensitive).
+
+    `mime_type` optionally restricts the match to a given MIME type.
+    `exclude_patterns` skips anything matching those (used to stop 'Interview
+    Summary & Takeaways' from matching the 'summary' archive pattern).
+    """
+    exclude_patterns = exclude_patterns or []
+    for f in files:
+        name_lower = f.get("name", "").lower()
+        if mime_type and f.get("mimeType") != mime_type:
+            continue
+        if any(ex in name_lower for ex in exclude_patterns):
+            continue
+        if any(pat in name_lower for pat in patterns):
+            return f
+    return None
+
+
+def regenerate_folder(folder_id, granola_key, all_videos=None, dry_run=False):
+    """Rewrite the Debrief sheet + Takeaways doc for an existing interview folder.
+
+    Workflow:
+      1. Read folder name, parse the date.
+      2. Re-fetch the matching Granola note + YouTube video by date.
+      3. Re-run extract_interview_data + synthesize_high_level_summary.
+      4. Locate the existing Debrief sheet and the existing Takeaways doc.
+      5. Rewrite them in place (no new folder, no new docs, IDs preserved).
+      6. If both the old "Summary ... Takeaways" and the old "High-level ...
+         Takeaways" exist, rewrite the High-level one as the new combined doc
+         and archive the Summary one by renaming (never delete).
+
+    In dry_run mode, no writes occur — the function just reports what it
+    *would* do.
+    """
+    result = {
+        "folder_id": folder_id,
+        "folder_name": "",
+        "date": "",
+        "dry_run": dry_run,
+        "actions": [],
+        "warnings": [],
+        "status": "pending",
+    }
+
+    folder_name = get_folder_name(folder_id)
+    result["folder_name"] = folder_name
+    log(f"\n📁 Regenerating: {folder_name} ({folder_id})")
+
+    date_str = _parse_date_from_folder_name(folder_name)
+    result["date"] = date_str
+    if not date_str:
+        result["warnings"].append("Could not parse date from folder name")
+        log(f"  ⚠️ Could not parse date from folder name '{folder_name}'", "warn")
+        result["status"] = "skipped_no_date"
+        return result
+
+    # Pull folder contents
+    files = list_folder_contents(folder_id)
+    log(f"  📄 Found {len(files)} files in folder")
+
+    # Find the existing Debrief sheet and existing Takeaways doc.
+    sheet_file = _find_file(
+        files, _DEBRIEF_SHEET_PATTERNS,
+        mime_type="application/vnd.google-apps.spreadsheet",
+    )
+    # Prefer the "Interview Summary & Takeaways" or "High-level Product
+    # Takeaways" doc; fall back to any "Summary" doc if neither exists.
+    takeaways_file = _find_file(
+        files, _TAKEAWAYS_PATTERNS,
+        mime_type="application/vnd.google-apps.document",
+    )
+    summary_archive_file = _find_file(
+        files, _ARCHIVE_SUMMARY_PATTERNS,
+        mime_type="application/vnd.google-apps.document",
+        exclude_patterns=["interview summary & takeaways"],
+    )
+    # If there's no explicit takeaways doc, treat the summary doc as the one
+    # to rewrite.
+    if not takeaways_file and summary_archive_file:
+        takeaways_file = summary_archive_file
+        summary_archive_file = None
+
+    # Fetch Granola note for this date
+    log("  📓 Fetching Granola notes...")
+    granola_data = fetch_granola_notes(granola_key)
+    granola_notes_list = []
+    if isinstance(granola_data, dict) and "error" in granola_data:
+        result["warnings"].append(f"Granola API error: {granola_data['error']}")
+    else:
+        granola_notes_list = granola_data if isinstance(granola_data, list) else granola_data.get("documents", granola_data.get("notes", []))
+
+    matched_note = None
+    for note in granola_notes_list:
+        note_title = note.get("title", "") or note.get("name", "")
+        if date_str and date_str in note_title:
+            matched_note = note
+            break
+
+    granola_summary = ""
+    granola_transcript = ""
+    if matched_note:
+        note_id = matched_note.get("id", "")
+        if note_id:
+            detail = fetch_granola_note_detail(granola_key, note_id)
+            if detail:
+                granola_summary = (
+                    detail.get("ai_summary") or detail.get("summary") or detail.get("content", "") or ""
+                )
+                granola_transcript = detail.get("transcript") or detail.get("transcription", "") or ""
+        log(f"  ✅ Matched Granola note: {matched_note.get('title', '')}")
+    else:
+        result["warnings"].append("No matching Granola note found")
+        log(f"  ⚠️ No matching Granola note for '{date_str}'", "warn")
+
+    # Fetch matching YT video for the date
+    if all_videos is None:
+        log("  🎬 Fetching YouTube videos...")
+        all_videos = fetch_youtube_livestreams(None)
+    matched_video = find_youtube_video_for_date(all_videos, date_str) if all_videos else None
+    yt_segments = []
+    video_id = ""
+    video_url = ""
+    yt_transcript_text = ""
+    if matched_video:
+        video_id = matched_video.get("id", "")
+        video_url = matched_video.get("url", "")
+        log(f"  🎥 Matched YouTube video: {matched_video.get('title', '')}")
+        yt_segments = get_youtube_transcript_timestamped(video_id) if video_id else []
+        yt_transcript_text = " ".join(s["text"] for s in yt_segments)
+    else:
+        result["warnings"].append("No matching YouTube video found")
+
+    # Pick best transcript (Granola > diarized YT > plain YT)
+    best_transcript = granola_transcript or ""
+    video_diarization_enabled = os.environ.get("ENABLE_VIDEO_DIARIZATION", "").lower() in ("1", "true", "yes")
+    if not best_transcript and yt_segments and video_id and video_diarization_enabled:
+        log("  🎞️ Running video-assisted diarization...")
+        best_transcript = diarize_transcript_with_video(video_id, yt_segments, folder_name) or yt_transcript_text
+    elif not best_transcript:
+        best_transcript = yt_transcript_text
+
+    # Re-run extraction + synthesis
+    log("  🤖 Re-running AI extraction...")
+    interview_data = None
+    if best_transcript or granola_summary:
+        interview_data = extract_interview_data(best_transcript, granola_summary, folder_name)
+
+    log("  💡 Re-generating Takeaways...")
+    hl_summary = synthesize_high_level_summary(
+        granola_summary, best_transcript, interview_data, folder_name
+    )
+    combined_text = build_combined_takeaways_text(date_str, granola_summary, hl_summary)
+    headers, rows = build_debrief_sheet(interview_data)
+
+    # ── Apply (or pretend to apply) updates ────────────────────────────────
+    if sheet_file:
+        action = {
+            "type": "update_sheet",
+            "file_id": sheet_file["id"],
+            "file_name": sheet_file["name"],
+            "rows": len(rows),
+            "columns": len(headers),
+        }
+        if not dry_run:
+            log(f"  ✍️  Updating Debrief sheet '{sheet_file['name']}'")
+            replace_google_sheet_content(sheet_file["id"], headers, rows)
+        else:
+            log(f"  (dry-run) Would update Debrief sheet '{sheet_file['name']}'")
+        result["actions"].append(action)
+    else:
+        result["warnings"].append("No Debrief sheet found in folder")
+        log("  ⚠️ No Debrief sheet found to update", "warn")
+
+    if takeaways_file:
+        action = {
+            "type": "update_doc",
+            "file_id": takeaways_file["id"],
+            "file_name": takeaways_file["name"],
+            "chars": len(combined_text),
+        }
+        new_name = f"({date_str}) Interview Summary & Takeaways"
+        if not dry_run:
+            log(f"  ✍️  Updating Takeaways doc '{takeaways_file['name']}'")
+            replace_google_doc_content(takeaways_file["id"], combined_text)
+            if takeaways_file["name"] != new_name:
+                log(f"  🏷️  Renaming Takeaways doc → '{new_name}'")
+                rename_drive_file(takeaways_file["id"], new_name)
+                action["renamed_to"] = new_name
+        else:
+            log(f"  (dry-run) Would update Takeaways doc '{takeaways_file['name']}' and rename → '{new_name}'")
+            action["renamed_to"] = new_name
+        result["actions"].append(action)
+    else:
+        result["warnings"].append("No Takeaways doc found in folder")
+        log("  ⚠️ No Takeaways doc found to update", "warn")
+
+    # Archive the old verbatim Summary doc if a separate Takeaways doc exists.
+    if summary_archive_file and takeaways_file and summary_archive_file["id"] != takeaways_file["id"]:
+        archive_name = f"(archived) {summary_archive_file['name']}"
+        action = {
+            "type": "rename_archive",
+            "file_id": summary_archive_file["id"],
+            "from": summary_archive_file["name"],
+            "to": archive_name,
+        }
+        if not dry_run:
+            if not summary_archive_file["name"].lower().startswith("(archived)"):
+                log(f"  🏷️  Archiving old Summary doc → '{archive_name}'")
+                rename_drive_file(summary_archive_file["id"], archive_name)
+        else:
+            log(f"  (dry-run) Would archive old Summary doc '{summary_archive_file['name']}' → '{archive_name}'")
+        result["actions"].append(action)
+
+    result["status"] = "dry_run_ok" if dry_run else "updated"
+    log(f"  ✅ Folder regeneration {'previewed' if dry_run else 'complete'}")
+    return result
+
+
+def regenerate_folders_workflow(config):
+    """Background job that regenerates a list of folder IDs (or every subfolder
+    of MAIN_FOLDER_ID if none given).
+
+    config:
+      {
+        "granola_api_key": "...",
+        "anthropic_api_key": "...",
+        "folder_ids": ["1abc...", ...] | [],   # empty = all children of MAIN_FOLDER_ID
+        "dry_run": bool,
+      }
+    """
+    global progress_log, current_job
+    progress_log = []
+    current_job = {"running": True, "done": False, "error": None, "results": []}
+
+    try:
+        granola_key = config["granola_api_key"]
+        dry_run = bool(config.get("dry_run", False))
+        folder_ids = config.get("folder_ids") or []
+
+        log(f"🚀 Starting Regenerate Workflow (dry_run={dry_run})")
+
+        if not folder_ids:
+            log(f"📁 No folder_ids given — walking all subfolders of MAIN_FOLDER_ID={MAIN_FOLDER_ID}")
+            children = list_folder_contents(MAIN_FOLDER_ID)
+            folder_ids = [
+                f["id"] for f in children
+                if f.get("mimeType") == "application/vnd.google-apps.folder"
+            ]
+            log(f"  Found {len(folder_ids)} subfolders to process")
+
+        # Fetch YT videos once.
+        log("🎬 Fetching YouTube videos (one-time)...")
+        all_videos = fetch_youtube_livestreams(None)
+        log(f"  Found {len(all_videos)} videos")
+
+        results = []
+        for fid in folder_ids:
+            try:
+                r = regenerate_folder(fid, granola_key, all_videos=all_videos, dry_run=dry_run)
+                results.append(r)
+            except Exception as e:
+                import traceback
+                log(f"  ❌ Failed to regenerate {fid}: {e}\n{traceback.format_exc()}", "error")
+                results.append({
+                    "folder_id": fid,
+                    "status": "error",
+                    "error": str(e),
+                })
+
+        log(f"\n🎉 Regenerate workflow complete — processed {len(results)} folders")
+        current_job["results"] = results
+        current_job["done"] = True
+        current_job["running"] = False
+
+    except Exception as e:
+        import traceback
+        log(f"❌ Fatal error: {e}\n{traceback.format_exc()}", "error")
+        current_job["error"] = str(e)
+        current_job["done"] = True
+        current_job["running"] = False
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -1515,6 +1918,70 @@ def run_granola_direct():
     )
     thread.start()
     return jsonify({"ok": True, "message": f"Granola-direct workflow started for {len(sessions)} sessions"})
+
+
+@app.route("/regenerate", methods=["POST"])
+def regenerate_route():
+    """Regenerate Debrief sheet + Takeaways doc in existing folders.
+
+    Body: {
+      "granola_api_key": "...",
+      "anthropic_api_key": "...",
+      "folder_ids": ["abc..."] | [],  # empty = all children of MAIN_FOLDER_ID
+      "dry_run": bool
+    }
+    """
+    if not session.get("google_token"):
+        return jsonify({"error": "Not authenticated with Google"}), 401
+    if current_job["running"]:
+        return jsonify({"error": "Job already running"}), 409
+
+    data = request.json or {}
+    granola_key = data.get("granola_api_key", "") or os.environ.get("GRANOLA_API_KEY", "")
+    anthropic_key = data.get("anthropic_api_key", "")
+    if not granola_key:
+        return jsonify({"error": "Missing granola_api_key"}), 400
+    if not anthropic_key:
+        return jsonify({"error": "Missing anthropic_api_key"}), 400
+
+    config = {
+        "granola_api_key": granola_key,
+        "anthropic_api_key": anthropic_key,
+        "folder_ids": data.get("folder_ids", []) or [],
+        "dry_run": bool(data.get("dry_run", False)),
+    }
+
+    session["anthropic_api_key"] = anthropic_key
+    _g_token_data["token"] = dict(session.get("google_token", {}))
+    _g_anthropic_key["key"] = anthropic_key
+
+    thread = threading.Thread(
+        target=regenerate_folders_workflow, args=(config,), daemon=True
+    )
+    thread.start()
+    mode = "dry-run" if config["dry_run"] else "live"
+    count = len(config["folder_ids"]) if config["folder_ids"] else "all"
+    return jsonify({"ok": True, "message": f"Regenerate started ({mode}, {count} folders)"})
+
+
+@app.route("/regenerate/list-folders", methods=["GET"])
+def regenerate_list_folders():
+    """Return the list of subfolders under MAIN_FOLDER_ID so the UI can render
+    checkboxes. Requires auth."""
+    if not session.get("google_token"):
+        return jsonify({"error": "Not authenticated with Google"}), 401
+    _g_token_data["token"] = dict(session.get("google_token", {}))
+    try:
+        children = list_folder_contents(MAIN_FOLDER_ID)
+        folders = [
+            {"id": c["id"], "name": c["name"]}
+            for c in children
+            if c.get("mimeType") == "application/vnd.google-apps.folder"
+        ]
+        folders.sort(key=lambda f: f["name"])
+        return jsonify({"ok": True, "folders": folders, "total": len(folders)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/status")
@@ -1762,10 +2229,247 @@ def batch_page():
 </html>""", mimetype="text/html")
 
 
+@app.route("/regenerate")
+def regenerate_page():
+    """Regenerate-existing-folders UI.
+
+    Single page with a mode toggle-free flow:
+      1. Auth check
+      2. Enter Anthropic + Granola keys
+      3. Load folder list via /regenerate/list-folders
+      4. Checkbox pick (or "all")
+      5. Dry-run toggle
+      6. Run → stream logs + results
+    """
+    is_authed_py = bool(session.get("google_token"))
+    auth_msg = "✅ Authenticated with Google" if is_authed_py else "❌ Not authenticated — <a href='/auth/login' style='color:#dc2626;font-weight:bold'>Login with Google</a>"
+    is_authed_js = "true" if is_authed_py else "false"
+    job_status = "running" if current_job["running"] else ("done" if current_job["done"] else "idle")
+    return Response(f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>Regenerate Interview Summaries</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 960px; margin: 40px auto; padding: 20px; background: #f9f9f9; color: #1a1a1a; }}
+    h1 {{ margin-top: 0; }}
+    .status {{ padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; background: #fff; border: 1px solid #ddd; }}
+    .card {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
+    .btn {{ background: #2563eb; color: #fff; border: none; padding: 12px 24px; font-size: 15px; border-radius: 8px; cursor: pointer; margin-right: 8px; }}
+    .btn:hover {{ background: #1d4ed8; }}
+    .btn:disabled {{ background: #93c5fd; cursor: not-allowed; }}
+    .btn-warn {{ background: #ea580c; }}
+    .btn-warn:hover {{ background: #c2410c; }}
+    .btn-secondary {{ background: #6b7280; }}
+    .btn-secondary:hover {{ background: #4b5563; }}
+    input[type=text], input[type=password] {{ width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; box-sizing: border-box; margin-bottom: 12px; }}
+    label {{ font-size: 13px; color: #555; display: block; margin-bottom: 4px; }}
+    #log {{ background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; height: 400px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }}
+    #results {{ margin-top: 20px; }}
+    .result-item {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }}
+    .result-item.error {{ border-left: 4px solid #dc2626; }}
+    .result-item.updated {{ border-left: 4px solid #16a34a; }}
+    .result-item.dry_run_ok {{ border-left: 4px solid #2563eb; }}
+    .result-item.skipped_no_date {{ border-left: 4px solid #9ca3af; }}
+    .folder-list {{ max-height: 380px; overflow-y: auto; border: 1px solid #eee; border-radius: 6px; padding: 10px; background: #fafafa; }}
+    .folder-row {{ display: flex; align-items: center; padding: 4px 2px; font-size: 13px; }}
+    .folder-row input {{ margin-right: 8px; width: auto; margin-bottom: 0; }}
+    .toolbar {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }}
+    .pill {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }}
+    .pill.dry {{ background: #dbeafe; color: #1e3a8a; }}
+    .pill.live {{ background: #fee2e2; color: #991b1b; }}
+    .muted {{ color: #6b7280; font-size: 12px; }}
+    .warning-banner {{ background: #fff7ed; border: 1px solid #fed7aa; color: #9a3412; padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <h1>🔄 Regenerate Interview Summaries</h1>
+  <p class="muted">Rewrites the Debrief sheet + Takeaways doc inside existing interview folders, using the new extraction and synthesis prompts. Folder IDs, URLs, and share permissions are preserved.</p>
+
+  <div class="status">
+    <strong>Auth:</strong> {auth_msg}<br>
+    <strong>Job status:</strong> <span id="jobStatus">{job_status}</span>
+  </div>
+
+  <div class="card">
+    <label>Granola API Key</label>
+    <input type="password" id="granolaKey" placeholder="granola_..." autocomplete="off" />
+
+    <label>Anthropic API Key</label>
+    <input type="password" id="anthropicKey" placeholder="sk-ant-..." autocomplete="off" />
+  </div>
+
+  <div class="card">
+    <div class="toolbar">
+      <button class="btn btn-secondary" id="loadBtn" onclick="loadFolders()">📁 Load folders</button>
+      <button class="btn btn-secondary" onclick="selectAll(true)">Select all</button>
+      <button class="btn btn-secondary" onclick="selectAll(false)">Clear selection</button>
+      <span id="folderCount" class="muted"></span>
+    </div>
+    <div class="folder-list" id="folderList">
+      <div class="muted">Click "Load folders" to fetch all subfolders in your main interview directory.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="warning-banner">
+      <strong>⚠️ Heads up:</strong> Running in LIVE mode overwrites the contents of the Debrief sheet and the Takeaways doc in each selected folder. The old content is not recoverable. Always run DRY-RUN first and review the actions.
+    </div>
+    <label><input type="checkbox" id="dryRun" checked style="width:auto;margin-right:6px" /> Dry run (preview actions, don't write anything)</label>
+    <br>
+    <button class="btn btn-warn" id="runBtn" onclick="runRegenerate()">🚀 Run regenerate</button>
+    <button class="btn btn-secondary" onclick="location.href='/'">← Back to main</button>
+    <span id="modePill"></span>
+  </div>
+
+  <div class="card">
+    <strong>Log</strong>
+    <div id="log" style="margin-top:10px">Waiting to start...</div>
+  </div>
+  <div id="results"></div>
+
+  <script>
+    let polling = null;
+    let loadedFolders = [];
+
+    async function loadFolders() {{
+      document.getElementById('folderList').innerHTML = '<div class="muted">Loading...</div>';
+      try {{
+        const resp = await fetch('/regenerate/list-folders');
+        const data = await resp.json();
+        if (!data.ok) {{
+          document.getElementById('folderList').innerHTML = '<div style="color:#dc2626">Error: ' + (data.error || 'failed') + '</div>';
+          return;
+        }}
+        loadedFolders = data.folders || [];
+        renderFolders();
+      }} catch (e) {{
+        document.getElementById('folderList').innerHTML = '<div style="color:#dc2626">Error: ' + e.message + '</div>';
+      }}
+    }}
+
+    function renderFolders() {{
+      document.getElementById('folderCount').textContent = loadedFolders.length + ' folders';
+      const html = loadedFolders.map(f => {{
+        return `<label class="folder-row">
+          <input type="checkbox" data-id="${{f.id}}" />
+          <span>${{f.name}}</span>
+        </label>`;
+      }}).join('');
+      document.getElementById('folderList').innerHTML = html || '<div class="muted">No folders found.</div>';
+    }}
+
+    function selectAll(value) {{
+      document.querySelectorAll('#folderList input[type=checkbox]').forEach(el => {{ el.checked = value; }});
+    }}
+
+    function getSelectedFolderIds() {{
+      return Array.from(document.querySelectorAll('#folderList input[type=checkbox]:checked')).map(el => el.dataset.id);
+    }}
+
+    async function runRegenerate() {{
+      const granolaKey = document.getElementById('granolaKey').value.trim();
+      const anthropicKey = document.getElementById('anthropicKey').value.trim();
+      if (!granolaKey) {{ alert('Please enter your Granola API key'); return; }}
+      if (!anthropicKey) {{ alert('Please enter your Anthropic API key'); return; }}
+
+      const dryRun = document.getElementById('dryRun').checked;
+      const folderIds = getSelectedFolderIds();
+      const pill = '<span class="pill ' + (dryRun ? 'dry">DRY RUN' : 'live">LIVE') + '</span>';
+      document.getElementById('modePill').innerHTML = ' ' + pill;
+
+      if (!dryRun) {{
+        const scope = folderIds.length ? folderIds.length + ' folder(s)' : 'ALL folders in main directory';
+        if (!confirm('LIVE MODE: This will overwrite the Debrief sheet and Takeaways doc in ' + scope + '. The old content will be lost. Continue?')) return;
+      }}
+
+      document.getElementById('runBtn').disabled = true;
+      document.getElementById('log').textContent = 'Starting regenerate...\\n';
+      document.getElementById('results').innerHTML = '';
+
+      const resp = await fetch('/regenerate', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{
+          granola_api_key: granolaKey,
+          anthropic_api_key: anthropicKey,
+          folder_ids: folderIds,
+          dry_run: dryRun,
+        }}),
+      }});
+      const data = await resp.json();
+      if (!data.ok) {{
+        document.getElementById('log').textContent += 'Error: ' + (data.error || JSON.stringify(data)) + '\\n';
+        document.getElementById('runBtn').disabled = false;
+        return;
+      }}
+      document.getElementById('log').textContent += data.message + '\\n';
+      startPolling();
+    }}
+
+    function startPolling() {{
+      if (polling) clearInterval(polling);
+      polling = setInterval(pollStatus, 3000);
+    }}
+
+    async function pollStatus() {{
+      const resp = await fetch('/status');
+      const data = await resp.json();
+      document.getElementById('jobStatus').textContent = data.running ? 'running' : (data.done ? 'done' : 'idle');
+
+      if (data.log && data.log.length) {{
+        document.getElementById('log').textContent = data.log.join('\\n');
+        document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+      }}
+
+      if (data.done || !data.running) {{
+        clearInterval(polling);
+        document.getElementById('runBtn').disabled = false;
+        if (data.results && data.results.length) {{
+          renderResults(data.results);
+        }}
+        if (data.error) {{
+          document.getElementById('log').textContent += '\\n❌ Error: ' + data.error;
+        }}
+      }}
+    }}
+
+    function renderResults(results) {{
+      let html = '<h2>Results (' + results.length + ')</h2>';
+      for (const r of results) {{
+        const cls = r.status || 'pending';
+        const warnings = (r.warnings || []).length ? '<div class="muted">⚠️ ' + r.warnings.join('; ') + '</div>' : '';
+        const actions = (r.actions || []).map(a => {{
+          if (a.type === 'update_sheet') return '• Updated sheet <em>' + a.file_name + '</em> (' + a.rows + ' rows)';
+          if (a.type === 'update_doc') return '• Updated doc <em>' + a.file_name + '</em>' + (a.renamed_to ? ' → ' + a.renamed_to : '');
+          if (a.type === 'rename_archive') return '• Archived ' + a.from + ' → ' + a.to;
+          return '• ' + JSON.stringify(a);
+        }}).join('<br>');
+        html += `<div class="result-item ${{cls}}">
+          <strong>${{r.folder_name || r.folder_id}}</strong> <span class="muted">(${{r.status}})</span>
+          <div>${{actions || '<span class="muted">no actions</span>'}}</div>
+          ${{warnings}}
+        </div>`;
+      }}
+      document.getElementById('results').innerHTML = html;
+    }}
+
+    if ('{job_status}' === 'running') startPolling();
+
+    if ({is_authed_js} === false) {{
+      document.getElementById('runBtn').disabled = true;
+      document.getElementById('runBtn').title = 'Login with Google first';
+      document.getElementById('loadBtn').disabled = true;
+    }}
+  </script>
+</body>
+</html>""", mimetype="text/html")
+
+
 if __name__ == "__main__":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
     print("\n🎙️  Interview Automation Tool")
     print("━" * 40)
     print("➡  Open: http://localhost:5050")
+    print("➡  Regenerate existing folders: http://localhost:5050/regenerate")
     print("━" * 40 + "\n")
     app.run(debug=False, port=5050)
