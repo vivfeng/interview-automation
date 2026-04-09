@@ -1683,12 +1683,56 @@ def regenerate_folders_workflow(config):
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    # Look for index.html next to app.py first, then templates/
+    """Home page — serves index.html if present, otherwise renders a simple
+    built-in landing page with links to the available workflows."""
     base = os.path.dirname(os.path.abspath(__file__))
     for path in [os.path.join(base, "index.html"), os.path.join(base, "templates", "index.html")]:
         if os.path.exists(path):
             return Response(open(path).read(), mimetype="text/html")
-    return Response("<h2>Error: index.html not found. Place index.html in the same folder as app.py</h2>", mimetype="text/html")
+
+    is_authed = bool(session.get("google_token"))
+    auth_line = (
+        "✅ Authenticated with Google"
+        if is_authed
+        else "❌ Not authenticated — <a href='/auth/login'>Login with Google</a>"
+    )
+    return Response(f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>Interview Automation</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 720px; margin: 60px auto; padding: 20px; background: #f9f9f9; color: #1a1a1a; }}
+    h1 {{ margin-top: 0; }}
+    .status {{ padding: 12px 16px; border-radius: 8px; background: #fff; border: 1px solid #ddd; margin-bottom: 24px; }}
+    .card {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 16px; }}
+    .card a {{ font-size: 16px; font-weight: 600; color: #2563eb; text-decoration: none; }}
+    .card a:hover {{ text-decoration: underline; }}
+    .card p {{ color: #555; font-size: 14px; margin: 8px 0 0; }}
+    .muted {{ color: #6b7280; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <h1>🎙️ Interview Automation</h1>
+  <div class="status"><strong>Auth:</strong> {auth_line}</div>
+
+  <div class="card">
+    <a href="/regenerate">🔄 Regenerate existing folders</a>
+    <p>Rewrite the Debrief sheet + Takeaways doc in existing interview folders in place, using the improved prompts. Supports dry-run preview.</p>
+  </div>
+
+  <div class="card">
+    <a href="/batch">📁 Batch create new folders</a>
+    <p>Run the Granola-direct workflow against a hard-coded list of sessions in <code>BATCH_SESSIONS</code>. Creates brand-new folders and docs.</p>
+  </div>
+
+  <div class="card">
+    <a href="/auth/login">🔐 Login / re-auth with Google</a>
+    <p>Enter your Google OAuth client credentials and grant Drive + Docs + Sheets + YouTube scopes.</p>
+  </div>
+
+  <p class="muted">Drop an <code>index.html</code> next to the script to override this landing page.</p>
+</body>
+</html>""", mimetype="text/html")
 
 
 # In-memory store for OAuth flow data (survives redirect)
